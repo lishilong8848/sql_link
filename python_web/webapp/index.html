@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>多数据库告警桌面工具</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <main class="page-shell">
+      <section id="connectionView" class="panel">
+        <div class="hero">
+          <p class="eyebrow">Python Backend + Web Frontend</p>
+          <h1>多数据库告警桌面工具</h1>
+          <p class="lead">
+            EXE 运行后会保留黑窗口，并在本机启动网页。用户只需要打开浏览器页面，就可以配置数据库、查询告警、勾选当前页记录并批量修改。
+          </p>
+        </div>
+        <div id="slotGrid" class="slot-grid"></div>
+      </section>
+
+      <section id="workspaceView" class="panel hidden">
+        <header class="workspace-head">
+          <div>
+            <p class="eyebrow">Alarm Workspace</p>
+            <h1 id="workspaceTitle">当前数据库</h1>
+            <p id="workspaceMeta" class="lead"></p>
+          </div>
+          <button id="logoutButton" class="btn btn-danger">退出当前数据库</button>
+        </header>
+
+        <section class="stats-grid">
+          <article class="stat-card">
+            <span class="stat-label">查询结果总数</span>
+            <strong id="totalCount">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">当前页已选</span>
+            <strong id="selectedCount">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">页码</span>
+            <strong id="pageInfo">第 1 / 1 页</strong>
+          </article>
+        </section>
+
+        <section class="toolbar-card">
+          <div class="toolbar-row toolbar-query-grid">
+            <label class="field">
+              <span>开始时间</span>
+              <input id="startTime" type="datetime-local" />
+            </label>
+            <label class="field">
+              <span>结束时间</span>
+              <input id="endTime" type="datetime-local" />
+            </label>
+            <button id="queryButton" class="btn btn-primary">查询</button>
+            <button id="resetButton" class="btn">重置为本月</button>
+          </div>
+          <div class="toolbar-row split toolbar-meta-row">
+            <p id="querySummary" class="summary-text">默认显示本月前 50 条</p>
+            <div class="toolbar-actions">
+              <button id="selectPageButton" class="btn">一键全选当前页</button>
+              <button id="clearSelectionButton" class="btn">清空选择</button>
+              <button id="openBatchButton" class="btn btn-primary">批量修改已选</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="table-card">
+          <div class="table-wrap">
+            <table id="eventTable">
+              <thead>
+                <tr>
+                  <th>勾选</th>
+                  <th>来源表</th>
+                  <th>guid</th>
+                  <th>event_time</th>
+                  <th>sys_type</th>
+                  <th>resource_id</th>
+                  <th>device_type</th>
+                  <th>content</th>
+                  <th>event_level</th>
+                  <th>event_type</th>
+                  <th>is_recover</th>
+                  <th>is_confirm</th>
+                  <th>is_accept</th>
+                  <th>confirm_description</th>
+                  <th>accept_description</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="eventTableBody"></tbody>
+            </table>
+          </div>
+          <div class="pagination-row">
+            <div class="pagination-left">
+              <label>
+                每页
+                <select id="pageSizeSelect">
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                  <option value="200">200</option>
+                </select>
+              </label>
+            </div>
+            <div class="pagination-right">
+              <button id="prevPageButton" class="btn">上一页</button>
+              <button id="nextPageButton" class="btn">下一页</button>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <div id="detailModal" class="modal hidden">
+      <div class="modal-card large">
+        <div class="modal-head">
+          <h2>记录详情</h2>
+          <button class="icon-btn" data-close="detailModal">关闭</button>
+        </div>
+        <div id="detailContent" class="detail-content"></div>
+      </div>
+    </div>
+
+    <div id="batchModal" class="modal hidden">
+      <div class="modal-card xlarge">
+        <div class="modal-head">
+          <div>
+            <h2>批量修改当前页已选记录</h2>
+            <p class="modal-subtitle">同一组修改会套用到当前页所有已勾选记录。</p>
+          </div>
+          <button class="icon-btn" data-close="batchModal">关闭</button>
+        </div>
+        <p id="batchWarning" class="warning-text"></p>
+        <div id="batchRows" class="batch-rows"></div>
+        <div class="batch-footer">
+          <button id="addBatchRowButton" class="btn">新增字段</button>
+          <button id="submitBatchButton" class="btn btn-primary">提交批量修改</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

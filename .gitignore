@@ -1,0 +1,6 @@
+py_build
+py_release
+*.spec
+__pycache__/
+python_web/__pycache__/
+*.log
