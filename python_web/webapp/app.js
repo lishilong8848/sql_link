@@ -396,6 +396,10 @@ function openBatchModal() {
     showToast("请先勾选当前页需要修改的记录。", true);
     return;
   }
+  if (!getEditableFields().length) {
+    showToast("当前只允许修改 recover_description 和 confirm_description。", true);
+    return;
+  }
   if (!state.batchRows.length) {
     state.batchRows = [createBatchRow()];
   }
@@ -412,13 +416,14 @@ function updateBatchWarning() {
 }
 
 function renderBatchRows() {
-  const fieldOptions = getEditableFields()
+  const editableFields = getEditableFields();
+  const fieldOptions = editableFields
     .map((field) => `<option value="${escapeHtml(field.name)}">${escapeHtml(`${field.name} (${field.dbType})`)}</option>`)
     .join("");
 
   elements.batchRows.innerHTML = state.batchRows
     .map((row) => {
-      const field = getEditableFields().find((item) => item.name === row.field);
+      const field = editableFields.find((item) => item.name === row.field);
       const inputControl =
         field?.inputKind === "textarea"
           ? `<textarea data-batch-field="value" data-batch-id="${row.id}" ${row.setNull ? "disabled" : ""}>${escapeHtml(row.value)}</textarea>`
@@ -448,6 +453,7 @@ function renderBatchRows() {
     }
   });
 
+  elements.addBatchRowButton.disabled = state.batchRows.length >= editableFields.length;
   updateBatchWarning();
 }
 
@@ -510,7 +516,7 @@ async function submitBatchUpdates() {
   closeModal(elements.batchModal);
   state.batchRows = [];
   const summary = result.warning
-    ? `批量修改完成，成功 ${result.affectedRows} 条，跳过 ${result.skippedCount || 0} 条。${result.warning}`
+    ? `批量修改完成，成功 ${result.affectedRows} 条。${result.warning}`
     : `批量修改成功，影响 ${result.affectedRows} 条记录。`;
   showToast(summary, Boolean(result.warning && !result.affectedRows));
   await loadEvents();

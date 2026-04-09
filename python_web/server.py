@@ -13,7 +13,7 @@ import time
 import webbrowser
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pymysql
 from flask import Flask, g, jsonify, request, send_from_directory
@@ -21,8 +21,7 @@ from pymysql.cursors import DictCursor
 from werkzeug.exceptions import HTTPException
 
 
-EDITABLE_EXCLUDED_FIELDS = {"guid", "event_time"}
-TRANSACTIONAL_ENGINES = {"INNODB", "NDB", "NDBCLUSTER"}
+EDITABLE_ALLOWED_FIELDS = {"recover_description", "confirm_description"}
 
 
 class ApiError(Exception):
@@ -257,6 +256,8 @@ class DatabaseService:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
+            latest_table = self.get_latest_event_table(connection, config.database)
+            self.log_session_diagnostics(connection, config.database, latest_table, "连接测试会话环境")
             log_info("数据库连接成功: label=%s database=%s", config.label, config.database)
         finally:
             connection.close()
@@ -287,17 +288,13 @@ class DatabaseService:
                     name=str(get_row_value(row, "column_name", "COLUMN_NAME", "Column_name") or ""),
                     dbType=str(get_row_value(row, "column_type", "COLUMN_TYPE", "Column_type") or ""),
                     nullable=str(get_row_value(row, "is_nullable", "IS_NULLABLE", "Is_nullable") or "").upper() == "YES",
-                    editable=str(get_row_value(row, "column_name", "COLUMN_NAME", "Column_name") or "") not in EDITABLE_EXCLUDED_FIELDS,
+                    editable=str(get_row_value(row, "column_name", "COLUMN_NAME", "Column_name") or "") in EDITABLE_ALLOWED_FIELDS,
                     inputKind=self.get_input_kind(
                         str(get_row_value(row, "column_name", "COLUMN_NAME", "Column_name") or ""),
                         str(get_row_value(row, "data_type", "DATA_TYPE", "Data_type") or ""),
                         str(get_row_value(row, "column_type", "COLUMN_TYPE", "Column_type") or ""),
                     ),
-                    warning=(
-                        "设置 is_recover = 1 可能触发恢复逻辑，并导致 mem_event 中的对应记录被删除。"
-                        if str(get_row_value(row, "column_name", "COLUMN_NAME", "Column_name") or "") == "is_recover"
-                        else ""
-                    ),
+                    warning="",
                 )
                 for row in rows
             ]
@@ -389,76 +386,42 @@ class DatabaseService:
                 if table_name not in existing_tables:
                     raise ApiError("目标表不存在: {}".format(table_name))
 
-            mem_event_engine = self.get_table_engine(connection, config.database, "mem_event")
-            has_nontransactional_mem_event = bool(mem_event_engine) and str(mem_event_engine).upper() not in TRANSACTIONAL_ENGINES
+            sample_table = sorted(grouped.keys())[0] if grouped else None
+            self.log_session_diagnostics(connection, config.database, sample_table, "批量修改会话环境")
             affected_rows = 0
-            skipped_targets: List[Dict[str, str]] = []
             with connection.cursor() as cursor:
                 for table_name, guids in grouped.items():
-                    safe_guids = list(guids)
-                    if has_nontransactional_mem_event:
-                        safe_guids, risky_guids = self.split_gtid_sensitive_guids(connection, table_name, guids, updates)
-                        skipped_targets.extend(
-                            [
-                                {
-                                    "table": table_name,
-                                    "guid": guid,
-                                    "reason": "gtid_recover_trigger",
-                                }
-                                for guid in risky_guids
-                            ]
-                        )
-
-                    if not safe_guids:
-                        continue
-
                     set_clause = ", ".join(["`{}` = %s".format(field_name) for field_name in updates.keys()])
-                    where_clause = ", ".join(["%s"] * len(safe_guids))
-                    sql = "UPDATE `{}` SET {} WHERE guid IN ({})".format(table_name, set_clause, where_clause)
-                    try:
-                        affected_rows += cursor.execute(sql, list(updates.values()) + safe_guids)
-                    except pymysql.err.OperationalError as exc:
-                        if exc.args and int(exc.args[0]) == 1785:
-                            log_warning(
-                                "检测到 GTID 限制，降级为逐条更新: database=%s table=%s guid_count=%s",
-                                config.database,
-                                table_name,
-                                len(safe_guids),
-                            )
-                            for guid in safe_guids:
-                                single_sql = "UPDATE `{}` SET {} WHERE guid = %s".format(table_name, set_clause)
-                                try:
-                                    affected_rows += cursor.execute(single_sql, list(updates.values()) + [guid])
-                                except pymysql.err.OperationalError as single_exc:
-                                    if single_exc.args and int(single_exc.args[0]) == 1785:
-                                        skipped_targets.append(
-                                            {
-                                                "table": table_name,
-                                                "guid": guid,
-                                                "reason": "gtid_runtime_trigger",
-                                            }
-                                        )
-                                        continue
-                                    raise
-                        else:
-                            raise
-
-            warning = self.build_batch_update_warning(skipped_targets, mem_event_engine)
+                    sql = "UPDATE `{}` SET {} WHERE guid = %s LIMIT 1".format(table_name, set_clause)
+                    for guid in guids:
+                        row_debug = self.get_event_row_debug_info(connection, table_name, guid)
+                        log_info(
+                            "准备修改事件记录: table=%s guid=%s is_recover=%s is_confirm=%s is_accept=%s recover_time=%s confirm_time=%s fields=%s",
+                            table_name,
+                            guid,
+                            row_debug.get("isRecover"),
+                            row_debug.get("isConfirm"),
+                            row_debug.get("isAccept"),
+                            row_debug.get("recoverTime"),
+                            row_debug.get("confirmTime"),
+                            ",".join(updates.keys()),
+                        )
+                        affected_rows += cursor.execute(sql, list(updates.values()) + [guid])
             log_info(
-                "批量修改成功: database=%s tables=%s target_count=%s fields=%s affected_rows=%s skipped_count=%s autocommit=%s",
+                "批量修改成功: database=%s tables=%s target_count=%s fields=%s affected_rows=%s mode=%s autocommit=%s",
                 config.database,
                 ",".join(sorted(grouped.keys())),
                 len(deduped),
                 ",".join(updates.keys()),
                 affected_rows,
-                len(skipped_targets),
+                "row_by_row",
                 True,
             )
             return {
                 "affectedRows": affected_rows,
-                "skippedCount": len(skipped_targets),
-                "skippedTargets": skipped_targets,
-                "warning": warning,
+                "skippedCount": 0,
+                "skippedTargets": [],
+                "warning": "",
             }
         except pymysql.err.OperationalError as exc:
             if exc.args and int(exc.args[0]) == 1785:
@@ -469,84 +432,19 @@ class DatabaseService:
                     ",".join(updates.keys()),
                 )
                 raise ApiError(
-                    "数据库拒绝了本次批量修改。当前库启用了 GTID 一致性限制，并且相关触发器涉及非事务表。"
-                    " 系统已经改为单语句自动提交模式；如果仍失败，请检查触发器关联表的存储引擎配置。"
+                    "数据库实际拒绝了这次内容修改，错误是 GTID 一致性限制。"
+                    " 程序没有再做额外拦截，也不会绕过数据库规则。"
+                    " 如果 Navicat 能改而这里不行，请确认两边连接的是同一实例、同一账号，以及相同的会话参数。"
                 ) from exc
             log_exception("批量修改失败: database=%s target_count=%s fields=%s", config.database, len(deduped), ",".join(updates.keys()))
+            raise
+        except ApiError:
             raise
         except Exception:
             log_exception("批量修改失败: database=%s target_count=%s fields=%s", config.database, len(deduped), ",".join(updates.keys()))
             raise
         finally:
             connection.close()
-
-    def split_gtid_sensitive_guids(self, connection, table_name: str, guids: List[str], updates: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-        if not guids:
-            return [], []
-
-        recover_map = self.get_guid_recover_map(connection, table_name, guids)
-        safe_guids: List[str] = []
-        risky_guids: List[str] = []
-        for guid in guids:
-            current_recover = recover_map.get(guid)
-            final_recover = self.resolve_final_is_recover(current_recover, updates)
-            if final_recover == 1:
-                risky_guids.append(guid)
-            else:
-                safe_guids.append(guid)
-        return safe_guids, risky_guids
-
-    def get_guid_recover_map(self, connection, table_name: str, guids: List[str]) -> Dict[str, Optional[int]]:
-        if not guids:
-            return {}
-
-        placeholders = ", ".join(["%s"] * len(guids))
-        sql = "SELECT guid, is_recover FROM `{}` WHERE guid IN ({})".format(table_name, placeholders)
-        with connection.cursor() as cursor:
-            cursor.execute(sql, guids)
-            rows = cursor.fetchall()
-
-        recover_map: Dict[str, Optional[int]] = {}
-        for row in rows:
-            guid = str(get_row_value(row, "guid", "GUID", "Guid") or "")
-            if not guid:
-                continue
-            recover_map[guid] = self.to_optional_int(get_row_value(row, "is_recover", "IS_RECOVER", "Is_recover"))
-        return recover_map
-
-    def resolve_final_is_recover(self, current_value: Optional[int], updates: Dict[str, Any]) -> Optional[int]:
-        if "is_recover" not in updates:
-            return current_value
-        return self.to_optional_int(updates.get("is_recover"))
-
-    def to_optional_int(self, value: Any) -> Optional[int]:
-        if value is None or value == "":
-            return None
-        try:
-            return int(value)
-        except Exception:
-            return None
-
-    def build_batch_update_warning(self, skipped_targets: List[Dict[str, str]], mem_event_engine: Optional[str]) -> str:
-        if not skipped_targets:
-            return ""
-
-        gtid_related = [item for item in skipped_targets if item.get("reason", "").startswith("gtid_")]
-        if not gtid_related:
-            return "有部分记录未更新，请查看服务端日志。"
-
-        if not mem_event_engine:
-            return (
-                "已跳过 {} 条记录。当前数据库存在 GTID 一致性限制，且这些记录触发了不兼容的更新逻辑。"
-                " 如果必须修改这类记录，需要在数据库侧调整相关触发器或关联表的存储引擎。"
-            ).format(len(gtid_related))
-
-        return (
-            "已跳过 {} 条记录。当前数据库的恢复类触发器会联动 mem_event".format(len(gtid_related))
-            + ("（{}）".format(mem_event_engine) if mem_event_engine else "")
-            + "，而这些记录更新后会处于 is_recover = 1 状态；在 GTID 一致性开启时，MySQL 会拒绝这类更新。"
-            " 如果必须修改这类记录，需要在数据库侧把 mem_event 调整为事务表，或修改相关触发器逻辑。"
-        )
 
     def get_existing_tables(self, connection, database: str, table_names: List[str]) -> List[str]:
         if not table_names:
@@ -585,6 +483,78 @@ class DatabaseService:
             row = cursor.fetchone()
         engine = get_row_value(row, "engine", "ENGINE", "Engine")
         return str(engine) if engine else None
+
+    def get_session_diagnostics(self, connection, database: str, sample_event_table: Optional[str] = None) -> Dict[str, Any]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    @@hostname AS hostname,
+                    @@port AS port,
+                    DATABASE() AS database_name,
+                    CURRENT_USER() AS user_name,
+                    @@session.sql_log_bin AS sql_log_bin_value,
+                    @@global.gtid_mode AS gtid_mode_value,
+                    @@global.enforce_gtid_consistency AS enforce_gtid_consistency_value
+                """
+            )
+            row = cursor.fetchone() or {}
+
+        return {
+            "hostname": get_row_value(row, "hostname", "HOSTNAME", "Hostname") or "",
+            "port": get_row_value(row, "port", "PORT", "Port") or "",
+            "currentDatabase": get_row_value(row, "database_name", "DATABASE_NAME", "Database_name") or database,
+            "currentUser": get_row_value(row, "user_name", "USER_NAME", "User_name") or "",
+            "sessionSqlLogBin": get_row_value(row, "sql_log_bin_value", "SQL_LOG_BIN_VALUE", "Sql_log_bin_value"),
+            "globalGtidMode": get_row_value(row, "gtid_mode_value", "GTID_MODE_VALUE", "Gtid_mode_value") or "",
+            "globalEnforceGtidConsistency": get_row_value(
+                row,
+                "enforce_gtid_consistency_value",
+                "ENFORCE_GTID_CONSISTENCY_VALUE",
+                "Enforce_gtid_consistency_value",
+            )
+            or "",
+            "memEventEngine": self.get_table_engine(connection, database, "mem_event") or "",
+            "sampleEventTable": sample_event_table or "",
+            "sampleEventEngine": self.get_table_engine(connection, database, sample_event_table) if sample_event_table else "",
+        }
+
+    def get_event_row_debug_info(self, connection, table_name: str, guid: str) -> Dict[str, Any]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT guid, is_recover, is_confirm, is_accept, recover_time, confirm_time FROM `{}` WHERE guid = %s LIMIT 1".format(table_name),
+                [guid],
+            )
+            row = cursor.fetchone() or {}
+
+        return {
+            "guid": get_row_value(row, "guid", "GUID", "Guid") or guid,
+            "isRecover": get_row_value(row, "is_recover", "IS_RECOVER", "Is_recover"),
+            "isConfirm": get_row_value(row, "is_confirm", "IS_CONFIRM", "Is_confirm"),
+            "isAccept": get_row_value(row, "is_accept", "IS_ACCEPT", "Is_accept"),
+            "recoverTime": get_row_value(row, "recover_time", "RECOVER_TIME", "Recover_time"),
+            "confirmTime": get_row_value(row, "confirm_time", "CONFIRM_TIME", "Confirm_time"),
+        }
+
+    def log_session_diagnostics(self, connection, database: str, sample_event_table: Optional[str], title: str) -> None:
+        try:
+            diagnostics = self.get_session_diagnostics(connection, database, sample_event_table)
+            log_info(
+                "%s: hostname=%s port=%s current_user=%s database=%s session_sql_log_bin=%s gtid_mode=%s enforce_gtid_consistency=%s mem_event_engine=%s sample_event_table=%s sample_event_engine=%s",
+                title,
+                diagnostics["hostname"],
+                diagnostics["port"],
+                diagnostics["currentUser"],
+                diagnostics["currentDatabase"],
+                diagnostics["sessionSqlLogBin"],
+                diagnostics["globalGtidMode"],
+                diagnostics["globalEnforceGtidConsistency"],
+                diagnostics["memEventEngine"] or "-",
+                diagnostics["sampleEventTable"] or "-",
+                diagnostics["sampleEventEngine"] or "-",
+            )
+        except Exception as exc:
+            log_warning("%s 诊断信息读取失败: %s", title, exc)
 
     def get_latest_event_table(self, connection, database: str) -> Optional[str]:
         with connection.cursor() as cursor:
